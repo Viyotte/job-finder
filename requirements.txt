@@ -1,0 +1,6 @@
+streamlit
+python-jobspy
+anthropic
+pandas
+openpyxl
+pypdf
