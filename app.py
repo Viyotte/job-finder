@@ -4,6 +4,9 @@
 
 import io                 # 업로드된 PDF를 메모리에서 읽을 때 사용
 import json               # AI 답변(JSON 텍스트)을 딕셔너리로 변환
+import hashlib            # 비밀번호로 출입증 문자열 만들기
+import pickle             # 결과를 파일로 저장/불러오기
+import threading          # 검색을 화면과 별개로 뒤에서 돌리기
 import re                 # 공고 본문에서 "5+ years" 패턴 찾기
 import time               # 검색 사이 쉬는 시간
 
@@ -55,13 +58,17 @@ def check_password():
     pw = st.secrets.get("APP_PASSWORD", "")          # 배포 설정(Secrets)에 저장한 비밀번호
     if not pw:                                        # 비밀번호를 안 정했으면 그냥 통과
         return True
-    if st.session_state.get("authed"):               # 이미 로그인했으면 통과
+    token = hashlib.sha256(("jf-" + pw).encode()).hexdigest()[:16]   # 비번에서 만든 출입증 문자열
+    if st.session_state.get("authed") or st.query_params.get("k") == token:  # 이미 로그인 or 주소에 출입증
+        st.session_state["authed"] = True
+        st.query_params["k"] = token                  # 주소창에 출입증 유지 (즐겨찾기해도 OK)
         return True
     st.title("💊 제약 BD 잡 파인더")
     entered = st.text_input("비밀번호", type="password")
     if st.button("들어가기"):
         if entered == pw:
             st.session_state["authed"] = True
+            st.query_params["k"] = token
             st.rerun()                                # 화면 새로고침
         else:
             st.error("비밀번호가 틀렸어요")
@@ -148,18 +155,105 @@ def score_one(client, resume, row):
 
 
 # ---------------------------------------------------------------
+# 백그라운드 작업: 화면이 꺼져도 서버에서 계속 돌아가고, 결과는 파일로 저장
+# ---------------------------------------------------------------
+RESULT_FILE = "/tmp/jobfinder_last_result.pkl"   # 마지막 검색 결과
+RESUME_FILE = "/tmp/jobfinder_last_resume.txt"   # 마지막으로 쓴 이력서
+
+
+@st.cache_resource          # 모든 접속이 같이 쓰는 하나의 상태 보관함 (앱이 켜져 있는 동안 유지)
+def job_state():
+    return {"running": False, "progress": 0.0, "status": "", "error": "", "lock": threading.Lock()}
+
+
+def load_result():
+    try:
+        with open(RESULT_FILE, "rb") as f:
+            return pickle.load(f)          # {"jobs": 표, "info": 요약문, "finished": 끝난 시각}
+    except Exception:
+        return None
+
+
+def run_search(S, resume, countries, terms, min_y, max_y, days, per, max_score, api_key):
+    """화면과 별개의 스레드에서 실행. st.* 화면 함수는 쓰면 안 됨 → S(상태 보관함)만 업데이트"""
+    try:
+        frames, combos = [], [(c, t) for c in countries for t in terms]
+        for i, (label, term) in enumerate(combos):
+            loc, code = COUNTRY_OPTIONS[label]
+            S["progress"] = 0.5 * i / len(combos)                       # 수집 단계 = 진행률 0~50%
+            S["status"] = f"공고 모으는 중 ({i + 1}/{len(combos)}): {label} / {term}"
+            try:
+                df = scrape_jobs(site_name=["linkedin", "indeed"], search_term=term, location=loc,
+                                 country_indeed=code, results_wanted=per, hours_old=days * 24,
+                                 linkedin_fetch_description=True, verbose=0)
+                df["country"] = label
+                frames.append(df)
+            except Exception:
+                pass                                                    # 한 조합 실패해도 계속
+            time.sleep(3)
+
+        if not frames or sum(len(f) for f in frames) == 0:
+            S["error"] = "공고를 하나도 못 가져왔어요. 잠시 후 다시 시도해 주세요."
+            return
+
+        jobs = pd.concat(frames, ignore_index=True)
+        jobs = jobs.drop_duplicates(subset=["job_url"]).drop_duplicates(subset=["title", "company"])
+        n_raw = len(jobs)
+        jobs = jobs[jobs.apply(lambda r: seniority_ok(r, min_y, max_y), axis=1)].copy()
+        jobs["관련도"] = jobs.apply(pre_score, axis=1)
+        jobs = jobs.sort_values("관련도", ascending=False)
+        rest = jobs.iloc[max_score:].copy()
+        jobs = jobs.head(max_score).copy()
+        info = (f"공고 {n_raw}개 수집 → 직급 필터 후 {len(jobs) + len(rest)}개 → 관련도 상위 {len(jobs)}개 AI 채점"
+                + (f" (나머지 {len(rest)}개는 '미채점')" if len(rest) else ""))
+
+        client = anthropic.Anthropic(api_key=api_key)
+        results = []
+        for i, (_, row) in enumerate(jobs.iterrows()):
+            S["progress"] = 0.5 + 0.5 * i / max(len(jobs), 1)           # 채점 단계 = 50~100%
+            S["status"] = f"이력서와 비교하는 중 ({i + 1}/{len(jobs)})"
+            try:
+                results.append(score_one(client, resume, row))
+            except Exception:
+                results.append((None, "", "채점 실패"))
+        if results:
+            jobs["점수"], jobs["요구 경력"], jobs["한줄평"] = zip(*results)
+        jobs = jobs.sort_values("점수", ascending=False)
+        if len(rest):
+            rest["점수"], rest["요구 경력"], rest["한줄평"] = None, "", "미채점 (채점 한도 초과)"
+            jobs = pd.concat([jobs, rest], ignore_index=True)
+
+        finished = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 9 * 3600))  # 한국/일본 시간
+        with open(RESULT_FILE, "wb") as f:
+            pickle.dump({"jobs": jobs, "info": info, "finished": finished}, f)
+    except Exception as e:
+        S["error"] = f"오류가 났어요: {str(e)[:200]}"
+    finally:
+        S["running"] = False                                            # 끝나면 항상 '실행 중' 해제
+
+
+# ---------------------------------------------------------------
 # 화면
 # ---------------------------------------------------------------
 if not check_password():
     st.stop()
 
+S = job_state()
 st.title("💊 제약 BD 잡 파인더")
-st.caption("여러 나라 공고를 한 번에 모아서, 내 이력서와 잘 맞는 순서대로 보여줘요.")
+st.caption("여러 나라 공고를 한 번에 모아서, 내 이력서와 잘 맞는 순서대로 보여줘요. "
+           "검색 중에 화면을 꺼도 서버에서 계속 돌아가요.")
+
+try:
+    with open(RESUME_FILE, encoding="utf-8") as f:
+        last_resume = f.read()                     # 지난번 이력서 불러오기 (다시 안 올려도 됨)
+except Exception:
+    last_resume = ""
 
 with st.sidebar:
     st.header("① 이력서")
     up = st.file_uploader("PDF나 TXT 파일 올리기", type=["pdf", "txt"])
-    pasted = st.text_area("또는 여기에 붙여넣기", height=150)
+    pasted = st.text_area("또는 여기에 붙여넣기 (지난번 이력서가 자동으로 채워져요)",
+                          value=last_resume, height=150)
 
     st.header("② 나라")
     countries = st.multiselect("검색할 나라", list(COUNTRY_OPTIONS),
@@ -176,80 +270,60 @@ with st.sidebar:
     per = st.select_slider("검색 1번당 공고 수", [10, 20, 30, 50], value=20)
     max_score = st.select_slider("AI 채점 최대 개수 (비용 조절)", [30, 50, 100, 200, 300], value=100)
 
-    go = st.button("🔍 검색 시작", type="primary", width="stretch")
+    go = st.button("🔍 검색 시작", type="primary", width="stretch", disabled=S["running"])
+    if S["running"]:
+        st.caption("검색이 진행 중이라 끝날 때까지 새 검색은 못 해요.")
 
 if go:
     resume = read_resume(up, pasted)
     terms = [t.strip() for t in terms_text.splitlines() if t.strip()]
     if len(resume.strip()) < 100:
         st.error("이력서를 먼저 올리거나 붙여넣어 주세요.")
-        st.stop()
-    if not countries or not terms:
+    elif not countries or not terms:
         st.error("나라와 검색어를 하나 이상 골라주세요.")
-        st.stop()
+    else:
+        with S["lock"]:                                  # 동시에 두 번 눌러도 하나만 시작
+            if not S["running"]:
+                with open(RESUME_FILE, "w", encoding="utf-8") as f:
+                    f.write(resume)                      # 이력서 저장 → 다음에 자동으로 채워짐
+                S.update(running=True, progress=0.0, status="시작하는 중...", error="")
+                threading.Thread(
+                    target=run_search, daemon=True,
+                    args=(S, resume, countries, terms, min_y, max_y, days, per, max_score,
+                          st.secrets["ANTHROPIC_API_KEY"]),
+                ).start()
+        st.rerun()
 
-    # 1) 수집
-    frames, total = [], len(countries) * len(terms)
-    bar = st.progress(0.0, text="공고 모으는 중...")
-    for i, (label, term) in enumerate([(c, t) for c in countries for t in terms]):
-        loc, code = COUNTRY_OPTIONS[label]
-        bar.progress(i / total, text=f"공고 모으는 중... {label} / {term}")
-        try:
-            df = scrape_jobs(site_name=["linkedin", "indeed"], search_term=term, location=loc,
-                             country_indeed=code, results_wanted=per, hours_old=days * 24,
-                             linkedin_fetch_description=True, verbose=0)
-            df["country"] = label
-            frames.append(df)
-        except Exception as e:
-            st.toast(f"{label} / {term} 검색 실패: {str(e)[:80]}")
-        time.sleep(3)
-    bar.progress(1.0, text="수집 완료")
 
-    if not frames or sum(len(f) for f in frames) == 0:
-        st.error("공고를 하나도 못 가져왔어요. 잠시 후 다시 시도해 주세요.")
-        st.stop()
+@st.fragment(run_every=3)        # 이 부분만 3초마다 새로고침해서 진행률 표시
+def progress_box():
+    if S["running"]:
+        st.progress(min(S["progress"], 1.0), text=S["status"])
+        st.caption("화면을 꺼도 괜찮아요. 나중에 다시 들어오면 여기서 이어서 보여요.")
+        st.session_state["was_running"] = True
+    elif st.session_state.pop("was_running", False):
+        st.rerun(scope="app")                            # 방금 끝났으면 전체 새로고침해서 결과 표시
 
-    jobs = pd.concat(frames, ignore_index=True)
-    jobs = jobs.drop_duplicates(subset=["job_url"]).drop_duplicates(subset=["title", "company"])
-    n_raw = len(jobs)
-    jobs = jobs[jobs.apply(lambda r: seniority_ok(r, min_y, max_y), axis=1)].copy()
-    jobs["관련도"] = jobs.apply(pre_score, axis=1)                 # 키워드 관련도 계산
-    jobs = jobs.sort_values("관련도", ascending=False)             # 관련도 높은 순으로 정렬
-    rest = jobs.iloc[max_score:].copy()                            # 채점 못 하는 나머지 (버리지 않고 보관)
-    jobs = jobs.head(max_score).copy()                             # 관련도 상위 N개만 AI 채점
-    st.info(f"공고 {n_raw}개 수집 → 직급 필터 후 {len(jobs) + len(rest)}개 → 관련도 상위 {len(jobs)}개 AI 채점"
-            + (f" (나머지 {len(rest)}개는 '미채점'으로 표 아래쪽에 표시)" if len(rest) else ""))
 
-    # 2) 채점
-    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-    bar2 = st.progress(0.0, text="이력서와 비교하는 중...")
-    results = []
-    for i, (_, row) in enumerate(jobs.iterrows()):
-        try:
-            results.append(score_one(client, resume, row))
-        except Exception:
-            results.append((None, "", "채점 실패"))
-        bar2.progress((i + 1) / len(jobs), text=f"이력서와 비교하는 중... {i + 1}/{len(jobs)}")
-    jobs["점수"], jobs["요구 경력"], jobs["한줄평"] = zip(*results)
-    jobs = jobs.sort_values("점수", ascending=False)
-    if len(rest):                                    # 미채점 공고를 표 맨 아래에 붙이기
-        rest["점수"], rest["요구 경력"], rest["한줄평"] = None, "", "미채점 (채점 한도 초과)"
-        jobs = pd.concat([jobs, rest], ignore_index=True)
-    st.session_state["result"] = jobs   # 필터 바꿔도 결과 유지
+progress_box()
+if S["error"]:
+    st.error(S["error"])
 
 # ---------------------------------------------------------------
-# 결과 표시
+# 결과 표시 (서버에 저장된 마지막 결과)
 # ---------------------------------------------------------------
-if "result" in st.session_state:
-    jobs = st.session_state["result"]
+saved = load_result()
+if saved is not None:
+    jobs = saved["jobs"]
+    st.success(f"마지막 검색 결과 · {saved['finished']} 완료 · {saved['info']}")
     c1, c2 = st.columns([1, 2])
     min_show = c1.slider("최소 점수", 0, 100, 60)
     picked = c2.multiselect("나라 필터", sorted(jobs["country"].unique()),
                             default=sorted(jobs["country"].unique()))
     show_unscored = st.checkbox("미채점 공고도 보기", value=False)
-    ok_score = jobs["점수"].fillna(-1) >= min_show                   # 점수 기준 통과
+    ok_score = jobs["점수"].fillna(-1) >= min_show
     if show_unscored:
-        ok_score = ok_score | jobs["점수"].isna()                    # 미채점도 포함
+        ok_score = ok_score | jobs["점수"].isna()
     view = jobs[ok_score & (jobs["country"].isin(picked))]
 
     show = view.rename(columns={"title": "직무", "company": "회사", "location": "위치",
@@ -268,5 +342,5 @@ if "result" in st.session_state:
     buf = io.BytesIO()
     show[[c for c in cols if c in show.columns]].to_excel(buf, index=False)
     st.download_button("📥 엑셀로 받기", buf.getvalue(), "pharma_jobs.xlsx")
-elif not go:
+elif not S["running"]:
     st.info("👈 왼쪽에서 이력서를 올리고 나라를 고른 뒤 **검색 시작**을 누르세요. 10~30분 걸릴 수 있어요.")
