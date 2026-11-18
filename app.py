@@ -92,6 +92,22 @@ def required_years(text):
     return min(nums) if nums else None
 
 
+# 채점 전에 공짜로 매기는 관련도 점수: 형 직무 키워드가 제목/본문에 얼마나 들어있는지
+KEYWORDS_TITLE = ["business development", "licensing", "search & evaluation", "search and evaluation",
+                  "strategy", "strategic", "valuation", "portfolio", "alliance", "transaction",
+                  "corporate development", "business analyst", "bd", "事業開発", "ライセンス", "経営企画"]
+KEYWORDS_BODY = ["pharma", "biotech", "licensing", "in-licens", "valuation", "npv", "rnpv", "due diligence",
+                 "phase i", "phase 1", "phase ii", "phase 2", "asset", "deal", "royalt", "forecast", "製薬"]
+
+
+def pre_score(row):
+    title = str(row.get("title", "")).lower()
+    body = str(row.get("description", "")).lower()
+    s = 3 * sum(k in title for k in KEYWORDS_TITLE)    # 제목에 있으면 3점씩
+    s += sum(k in body for k in KEYWORDS_BODY)          # 본문에 있으면 1점씩
+    return s
+
+
 def seniority_ok(row, min_y, max_y):
     title = str(row.get("title", "")).lower()
     if any(w in title for w in TOO_JUNIOR) or any(w in title for w in TOO_SENIOR):
@@ -158,7 +174,7 @@ with st.sidebar:
     st.header("⑤ 기타")
     days = st.selectbox("최근 며칠 공고", [7, 14, 30, 60], index=2)
     per = st.select_slider("검색 1번당 공고 수", [10, 20, 30, 50], value=20)
-    max_score = st.select_slider("AI 채점 최대 개수 (비용 조절)", [30, 50, 100, 200], value=100)
+    max_score = st.select_slider("AI 채점 최대 개수 (비용 조절)", [30, 50, 100, 200, 300], value=100)
 
     go = st.button("🔍 검색 시작", type="primary", width="stretch")
 
@@ -196,8 +212,13 @@ if go:
     jobs = pd.concat(frames, ignore_index=True)
     jobs = jobs.drop_duplicates(subset=["job_url"]).drop_duplicates(subset=["title", "company"])
     n_raw = len(jobs)
-    jobs = jobs[jobs.apply(lambda r: seniority_ok(r, min_y, max_y), axis=1)].head(max_score).copy()
-    st.info(f"공고 {n_raw}개 수집 → 직급 필터 후 {len(jobs)}개 채점")
+    jobs = jobs[jobs.apply(lambda r: seniority_ok(r, min_y, max_y), axis=1)].copy()
+    jobs["관련도"] = jobs.apply(pre_score, axis=1)                 # 키워드 관련도 계산
+    jobs = jobs.sort_values("관련도", ascending=False)             # 관련도 높은 순으로 정렬
+    rest = jobs.iloc[max_score:].copy()                            # 채점 못 하는 나머지 (버리지 않고 보관)
+    jobs = jobs.head(max_score).copy()                             # 관련도 상위 N개만 AI 채점
+    st.info(f"공고 {n_raw}개 수집 → 직급 필터 후 {len(jobs) + len(rest)}개 → 관련도 상위 {len(jobs)}개 AI 채점"
+            + (f" (나머지 {len(rest)}개는 '미채점'으로 표 아래쪽에 표시)" if len(rest) else ""))
 
     # 2) 채점
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
@@ -211,6 +232,9 @@ if go:
         bar2.progress((i + 1) / len(jobs), text=f"이력서와 비교하는 중... {i + 1}/{len(jobs)}")
     jobs["점수"], jobs["요구 경력"], jobs["한줄평"] = zip(*results)
     jobs = jobs.sort_values("점수", ascending=False)
+    if len(rest):                                    # 미채점 공고를 표 맨 아래에 붙이기
+        rest["점수"], rest["요구 경력"], rest["한줄평"] = None, "", "미채점 (채점 한도 초과)"
+        jobs = pd.concat([jobs, rest], ignore_index=True)
     st.session_state["result"] = jobs   # 필터 바꿔도 결과 유지
 
 # ---------------------------------------------------------------
@@ -222,7 +246,11 @@ if "result" in st.session_state:
     min_show = c1.slider("최소 점수", 0, 100, 60)
     picked = c2.multiselect("나라 필터", sorted(jobs["country"].unique()),
                             default=sorted(jobs["country"].unique()))
-    view = jobs[(jobs["점수"].fillna(0) >= min_show) & (jobs["country"].isin(picked))]
+    show_unscored = st.checkbox("미채점 공고도 보기", value=False)
+    ok_score = jobs["점수"].fillna(-1) >= min_show                   # 점수 기준 통과
+    if show_unscored:
+        ok_score = ok_score | jobs["점수"].isna()                    # 미채점도 포함
+    view = jobs[ok_score & (jobs["country"].isin(picked))]
 
     show = view.rename(columns={"title": "직무", "company": "회사", "location": "위치",
                                 "country": "나라", "date_posted": "게시일", "job_url": "링크"})
