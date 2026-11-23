@@ -208,14 +208,22 @@ def run_search(S, resume, countries, terms, min_y, max_y, days, per, max_score, 
                 + (f" (나머지 {len(rest)}개는 '미채점')" if len(rest) else ""))
 
         client = anthropic.Anthropic(api_key=api_key)
-        results = []
+        results, fails = [], 0
         for i, (_, row) in enumerate(jobs.iterrows()):
+            if fails >= 3:                                              # 3번 연속 실패 → 나머지는 시도 안 함
+                results.append((None, "", "채점 중단 (위 오류 때문에)"))
+                continue
             S["progress"] = 0.5 + 0.5 * i / max(len(jobs), 1)           # 채점 단계 = 50~100%
             S["status"] = f"이력서와 비교하는 중 ({i + 1}/{len(jobs)})"
             try:
                 results.append(score_one(client, resume, row))
-            except Exception:
-                results.append((None, "", "채점 실패"))
+                fails = 0                                               # 성공하면 연속 실패 횟수 초기화
+            except Exception as e:
+                fails += 1
+                reason = explain_api_error(e)
+                results.append((None, "", "채점 실패: " + reason))
+                if fails >= 3:
+                    S["error"] = "AI 채점이 연속으로 실패해서 멈췄어요. " + reason
         if results:
             jobs["점수"], jobs["요구 경력"], jobs["한줄평"] = zip(*results)
         jobs = jobs.sort_values("점수", ascending=False)
@@ -230,6 +238,39 @@ def run_search(S, resume, countries, terms, min_y, max_y, days, per, max_score, 
         S["error"] = f"오류가 났어요: {str(e)[:200]}"
     finally:
         S["running"] = False                                            # 끝나면 항상 '실행 중' 해제
+
+
+def explain_api_error(e):
+    """API 에러를 원인별 한국어 설명으로 바꿔줌"""
+    msg = str(e)
+    low = msg.lower()
+    if "credit balance" in low or "billing" in low:
+        why = "API 크레딧(잔액)이 부족해요 → Claude Console에서 충전하세요."
+    elif "authentication" in low or "x-api-key" in low or "401" in low:
+        why = "API 키가 틀렸어요 → Streamlit Secrets의 ANTHROPIC_API_KEY를 확인하세요."
+    elif "permission" in low or "403" in low:
+        why = "이 키로는 권한이 없어요 → 키가 속한 워크스페이스 설정을 확인하세요."
+    elif "spend" in low or "usage limit" in low:
+        why = "지출 한도에 걸렸어요 → Console의 워크스페이스/조직 한도를 확인하세요."
+    elif "not_found" in low or "404" in low:
+        why = "모델 이름을 찾을 수 없어요 → 코드의 MODEL 값을 확인해야 해요."
+    elif "rate" in low or "429" in low:
+        why = "요청이 너무 많아 잠시 막혔어요 → 몇 분 뒤 다시 시도하세요."
+    elif "overloaded" in low or "529" in low:
+        why = "Claude 서버가 혼잡해요 → 잠시 뒤 다시 시도하세요."
+    else:
+        why = "알 수 없는 오류"
+    return f"{why} (원문: {type(e).__name__}: {msg[:150]})"
+
+
+def api_ok(api_key):
+    """검색 시작 전에 API가 되는지 짧게 한 번 찔러보기 → 안 되면 20분 기다리기 전에 바로 알려줌"""
+    try:
+        anthropic.Anthropic(api_key=api_key).messages.create(
+            model=MODEL, max_tokens=5, messages=[{"role": "user", "content": "hi"}])
+        return None
+    except Exception as e:
+        return explain_api_error(e)
 
 
 # ---------------------------------------------------------------
@@ -281,6 +322,8 @@ if go:
         st.error("이력서를 먼저 올리거나 붙여넣어 주세요.")
     elif not countries or not terms:
         st.error("나라와 검색어를 하나 이상 골라주세요.")
+    elif (problem := api_ok(st.secrets["ANTHROPIC_API_KEY"])):
+        st.error("검색 전에 AI 연결을 확인했는데 문제가 있어요. " + problem)   # 20분 기다리기 전에 바로 알려줌
     else:
         with S["lock"]:                                  # 동시에 두 번 눌러도 하나만 시작
             if not S["running"]:
