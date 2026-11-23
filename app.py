@@ -142,14 +142,32 @@ Weigh pharma BD/licensing/valuation/strategy experience, years, seniority, and l
 """
 
 
+THINKING_OFF = {"ok": True}   # '생각 끄기' 옵션을 이 모델이 받아주는지 기억
+
+
+def create_msg(client, prompt):
+    """채점 요청. 생각(thinking)을 끄면 더 빠르고 싸지만, 모델이 거부하면 끄지 않고 다시 요청"""
+    base = dict(model=MODEL, max_tokens=1500, messages=[{"role": "user", "content": prompt}])
+    if THINKING_OFF["ok"]:
+        try:
+            return client.messages.create(**base, thinking={"type": "disabled"})
+        except Exception as e:
+            if "thinking" not in str(e).lower():   # 생각 옵션과 무관한 에러면 그대로 올려보냄
+                raise
+            THINKING_OFF["ok"] = False             # 이 모델은 옵션 거부 → 다음부터 옵션 없이
+    return client.messages.create(**base)
+
+
 def score_one(client, resume, row):
     prompt = PROMPT.format(
         resume=resume[:8000], title=row.get("title"), company=row.get("company"),
         location=row.get("location"), description=str(row.get("description", ""))[:6000],
     )
-    msg = client.messages.create(model=MODEL, max_tokens=300,
-                                 messages=[{"role": "user", "content": prompt}])
-    text = msg.content[0].text
+    msg = create_msg(client, prompt)
+    # 답변에는 '생각(thinking)' 블록이 섞여 올 수 있음 → 실제 글(text) 블록만 모아서 읽기
+    text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+    if "{" not in text:
+        raise ValueError(f"AI 답변에 JSON이 없어요 (stop_reason={getattr(msg, 'stop_reason', '?')})")
     data = json.loads(text[text.find("{"): text.rfind("}") + 1])
     return int(data.get("score", 0)), data.get("years_required", ""), data.get("reason", "")
 
